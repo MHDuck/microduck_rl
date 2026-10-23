@@ -28,7 +28,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from infer_policy import (  # noqa: E402
-    BAM_MAX_CURRENT, BAM_STIFF_SOLIMP_FRICTION, BAM_STIFF_SOLREF_FRICTION, DEFAULT_POSE, TerminalInput, load_bam_model,
+    BAM_KP_FW, BAM_MAX_CURRENT, BAM_VIN_MIN, BAM_STIFF_SOLIMP_FRICTION, BAM_STIFF_SOLREF_FRICTION,
+    DEFAULT_POSE, FeetechMujocoController, TerminalInput, load_bam_model,
 )
 
 from mjlab_microduck.pickup.features import FEAT_DIM, paused_target_rel  # noqa: E402
@@ -41,8 +42,7 @@ DT, DECIM = 0.005, 4
 CTRL_DT = DT * DECIM
 
 
-def build(scene, kp_fw=200.0, vin=7.4):
-    from bam.mujoco import MujocoController
+def build(scene, kp_fw=BAM_KP_FW, vin=7.4):
     bam = load_bam_model(kp_fw, vin, BAM_MAX_CURRENT)
     kt, R = bam.kt.value, bam.R.value
     spec = mujoco.MjSpec.from_file(scene)
@@ -63,7 +63,7 @@ def build(scene, kp_fw=200.0, vin=7.4):
     model = spec.compile(); model.opt.timestep = DT
     model.vis.global_.offwidth, model.vis.global_.offheight = 1280, 960
     data = mujoco.MjData(model)
-    ctrl = MujocoController(bam, names, model, data, vin_drop_gain=0.1, vin_min=6.0)
+    ctrl = FeetechMujocoController(bam, names, model, data, vin_drop_gain=0.1, vin_min=BAM_VIN_MIN)
     return model, data, ctrl, names, kt
 
 
@@ -92,6 +92,7 @@ class Demo:
     def reset(self):
         mujoco.mj_resetDataKeyframe(self.m, self.d, 0) if self.m.nkey else mujoco.mj_resetData(self.m, self.d)
         self.d.qpos[self.qadr] = DEFAULT_POSE
+        self.bam.reset(self.d.qpos)
         mujoco.mj_forward(self.m, self.d)
         self.last_action = np.zeros(14, np.float32)
         self.cmd = np.zeros(13, np.float32)

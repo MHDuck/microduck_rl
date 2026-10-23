@@ -161,6 +161,7 @@ def test_velocity_cfg_unchanged_no_gate():
 
     cfg = make_microduck_velocity_env_cfg()
     assert "gate_height_low" not in cfg.rewards["head_pose_bias"].params
+    assert cfg.rewards["head_pose_bias"].params["component_indices"] == (0, 1)
 
 
 def test_velstand_inherited_term_is_gated():

@@ -233,7 +233,7 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
-# Backlash variants — ±1° serial gear play per servo + encoder-through-backlash
+# Backlash variants — ±1.25° serial gear play per servo + encoder-through-backlash
 # actuator feedback and joint obs (see tasks/backlash.py). Each family keeps its
 # base task's collision model: Velocity → robot_walk_backlash.xml,
 # VelStand → robot_allcollisions_backlash.xml, StandUp → robot_groundcontact_backlash.xml. Obs/action dims are

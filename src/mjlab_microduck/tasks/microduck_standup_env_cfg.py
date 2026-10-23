@@ -691,7 +691,7 @@ def make_microduck_standup_env_cfg(
         mode="reset",
     )
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = foot_frictions_geom_names
-    cfg.events["foot_friction"].params["ranges"] = (0.7, 1.3)  # match velocity
+    cfg.events["foot_friction"].params["ranges"] = (0.6, 1.8)  # recover on floor or carpet
 
     # Start in the sitting keyframe with noise on joints + trunk tilt. Real
     # deployment hand-off from the sit policy won't reproduce the SIT

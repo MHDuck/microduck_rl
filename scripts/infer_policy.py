@@ -14,10 +14,12 @@ import termios
 import threading
 import time
 import tty
+from pathlib import Path
 import numpy as np
 import mujoco
 import mujoco.viewer
 import onnxruntime as ort
+from bam.mujoco import MujocoController
 
 MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_ramps.xml"
@@ -31,12 +33,13 @@ MICRODUCK_BALL_XML = "src/mjlab_microduck/robot/microduck/scene_ball.xml"
 # trained against in warp). Not imported from there: that module drags in
 # mjlab/torch/warp (~16 s import) for a CPU rehearsal script. Locked by
 # tests/test_infer_policy_bam.py.
-BAM_MOTOR_NAME = "xl330"
+BAM_PARAMS_PATH = (Path(__file__).resolve().parents[1]
+                   / "src/mjlab_microduck/robot/microduck/params/1910_m6.json")
 BAM_MODEL = "m6"
-BAM_KP_FW = 200.0                 # microduck's preserved firmware stiffness
-BAM_VIN_RANGE = (6.5, 8.2)        # per-env battery voltage DR in training
+BAM_KP_FW = 5.0                    # Feetech HD1910 / HLS1910 firmware P
+BAM_VIN_RANGE = (7.0, 7.6)        # measured HD1910 pack operating envelope
 BAM_VIN_DROP_GAIN_RANGE = (0.0, 0.2)  # load-dependent sag V_drop = gain * sum|tau|
-BAM_VIN_MIN = 6.0                 # floor on effective voltage after sag
+BAM_VIN_MIN = 6.8                 # floor on effective voltage after sag
 BAM_MAX_CURRENT = None            # training runs WITHOUT the firmware current limiter
 # Stiff joint-friction constraint, copied from bam.mjlab.BamActuator
 # (stiff_frictionloss=True in training): warp has no noslip solver, so BAM
@@ -47,13 +50,25 @@ BAM_STIFF_SOLIMP_FRICTION = (0.99, 0.9999, 0.001, 0.5, 2.0)
 
 
 def load_bam_model(kp_fw: float, vin: float, max_current):
-    """Build the BAM M6 model + XL330 voltage-controlled actuator."""
+    """Build the fitted HD1910 M6 model with the Feetech firmware controller."""
     from bam.model import load_model
-    bam_model = load_model(motor_name=BAM_MOTOR_NAME, model=BAM_MODEL)
+    if max_current and max_current > 0:
+        raise ValueError("BAM's Feetech controller does not implement a firmware current limit")
+    bam_model = load_model(str(BAM_PARAMS_PATH))
+    bam_model.actuator.q_target_smooth = 0.0
     bam_model.actuator.kp = kp_fw
     bam_model.actuator.vin = vin
-    bam_model.actuator.max_current = max_current if (max_current and max_current > 0) else None
+    bam_model.actuator.max_current = None
     return bam_model
+
+
+class FeetechMujocoController(MujocoController):
+    """Reset Feetech's internal goal with the robot instead of carrying episode history."""
+
+    def reset(self, qpos):
+        super().reset(qpos)
+        self.model.actuator.q_target_smooth = self.q_target.copy()
+        self.last_ts = self.mujoco_data.time
 
 
 def load_mujoco_with_bam(xml_path: str, bam_model, timestep: float, vin_drop_gain, vin_min):
@@ -65,8 +80,6 @@ def load_mujoco_with_bam(xml_path: str, bam_model, timestep: float, vin_drop_gai
     friction constraint. Armature is set on the dofs by MujocoController.
     Returns (model, data, bam_ctrl, actuator_names).
     """
-    from bam.mujoco import MujocoController
-
     kt = bam_model.kt.value
     R = bam_model.R.value
     force_limit = bam_model.actuator.vin * kt / R
@@ -95,7 +108,7 @@ def load_mujoco_with_bam(xml_path: str, bam_model, timestep: float, vin_drop_gai
     model = spec.compile()
     model.opt.timestep = timestep
     data = mujoco.MjData(model)
-    bam_ctrl = MujocoController(bam_model, names, model, data,
+    bam_ctrl = FeetechMujocoController(bam_model, names, model, data,
                                 vin_drop_gain=vin_drop_gain, vin_min=vin_min)
     print(f"BAM {BAM_MODEL} actuators on {len(names)} joints: kt={kt:.4f} R={R:.4f} "
           f"vin={bam_model.actuator.vin:.2f}V kp_fw={bam_model.actuator.kp:.0f} "
@@ -1209,8 +1222,8 @@ def main():
     parser.add_argument("--kp-fw", type=float, default=BAM_KP_FW,
                         help="BAM firmware P-gain (training uses %(default)s).")
     parser.add_argument("--current-limit", type=float, default=0.0,
-                        help="XL330 firmware current limit [A]. With BAM this is the duty-cycle "
-                             "limiter of the voltage model (as bam models it); with --no-bam the "
+                        help="Legacy XML torque cap expressed as current [A]. Unsupported by the Feetech BAM "
+                             "controller; with --no-bam the "
                              "actuator force is clipped to +/- current_limit * kt. Training runs "
                              "WITHOUT a current limit, so the default is off (<=0).")
     parser.add_argument("--foot-friction", type=float, default=None,
@@ -1272,7 +1285,7 @@ def main():
     print(f"Loading MuJoCo model from: {xml_path}")
     bam_ctrl = None
     if not args.no_bam:
-        # Same actuator the policies are trained against in warp (BAM M6 XL330,
+        # Same actuator the policies are trained against in warp (BAM M6 HD1910,
         # voltage control + load-dependent friction budget), driven on CPU by
         # bam.mujoco.MujocoController. Voltage DR collapses to fixed --vin /
         # --vin-drop-gain (training samples them per env).
@@ -1286,13 +1299,11 @@ def main():
         data = mujoco.MjData(model)
         print("Legacy MuJoCo position actuators (--no-bam): NOT the actuator the policy was trained with")
 
-    # (--no-bam only) XL330 firmware current limit. The motors saturate current
-    # at ~1.75 A; since torque = kt * current, this caps the actuator force at
-    # +/- kt * I_max. With BAM the limiter is modelled inside the voltage
-    # controller instead (see load_bam_model). kt comes from the bam package.
+    # Legacy XML approximation only: torque = kt * current. The Feetech
+    # BAM controller does not implement a firmware current limiter.
     if args.no_bam and args.current_limit and args.current_limit > 0:
         from bam.model import load_model
-        kt = load_model(motor_name="xl330", model="m6").kt.value
+        kt = load_model(str(BAM_PARAMS_PATH)).kt.value
         torque_limit = kt * args.current_limit
         model.actuator_forcerange[:, 0] = -torque_limit
         model.actuator_forcerange[:, 1] = torque_limit

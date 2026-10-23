@@ -68,7 +68,7 @@ What changed vs the 2026-07 design (kept below, still valid):
     beyond the walking DR (ramped ±0.6 → ±1.2 m/s; a 1 m/s Δv topples this
     robot ~100% of the time in the CPU baseline), so falls are frequent
     on-policy data rather than rare accidents.
-  - Backlash twin: robot_allcollisions_backlash.xml (add_backlash.py, 2° total)
+  - Backlash twin: robot_allcollisions_backlash.xml (add_backlash.py, 2.5° total)
     → Mjlab-VelStand-*-Backlash-MicroDuck mirror the base model as required.
   - NOT modelled on purpose (user decision 2026-09-09): the daemon limp. If the
     policy finds a gentler strategy with full authority, better let it.
@@ -596,7 +596,11 @@ def _add_body_control(cfg: ManagerBasedRlEnvCfg, play: bool) -> None:
 
 def make_microduck_velstand_env_cfg(play: bool = False, rough: bool = False) -> ManagerBasedRlEnvCfg:
     # Walk layer: the PROVEN velocity recipe, verbatim.
-    cfg = make_microduck_velocity_env_cfg(play=play, rough=rough)
+    cfg = make_microduck_velocity_env_cfg(
+        play=play,
+        rough=rough,
+        stride_tuning=False,
+    )
 
     # In play mode the curriculum doesn't run, so the fall-termination disable
     # below never fires — just delete the termination outright.

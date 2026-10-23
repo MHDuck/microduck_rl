@@ -133,16 +133,18 @@ SIT_UPRIGHT_Z   = 0.075
 # excess-distance cost (~50 total for an instant drop) — crashing won ~7×.
 # With the ramp, being AHEAD of the setpoint zeroes the height/composite
 # stack for the ramp remainder, so tracking the slow setpoint is the argmax.
-# 55 mm over 2 s ≈ 0.028 m/s, comfortably under both caps below.
-POSTURE_RAMP_S = 2.0
+# 55 mm over 3 s ≈ 0.018 m/s.  The hardware report showed that the former
+# two-second transition still let the head fall into the floor; a slower target
+# removes the arrival-time incentive that produced that crash-sit.
+POSTURE_RAMP_S = 3.0
 
 # Vertical-speed caps (m/s) — now BACKSTOPS for overshoot/bounce around the
 # slewed target (see POSTURE_RAMP_S), not the primary gentleness mechanism.
 # The rise cap is looser (rising against gravity needs some momentum to get
 # over the heels) and is introduced by curriculum only after the rise motion
 # has been discovered — see the rise_speed_weight curriculum.
-MAX_DESCENT_SPEED = 0.05
-MAX_RISE_SPEED    = 0.08
+MAX_DESCENT_SPEED = 0.035
+MAX_RISE_SPEED    = 0.07
 
 # ── Seated fall-back hardening (2026-10) ──────────────────────────────────────
 # Real robot: an abrupt head move while seated tips it BACKWARD; it stays
@@ -221,10 +223,17 @@ def make_microduck_sitstand_env_cfg(
         num_slots=1,
     )
 
-    # NOTE: no head-ground contact penalty here (unlike the sit env). Using the
-    # head as a third support point during transitions is explicitly allowed —
-    # the plank-as-terminal-rest exploit is anti-selected by posture_composite
-    # + posture_stillness instead (both ≈0 at plank tilt/height).
+    # The real head was striking the floor during the sit transition.  Keep
+    # contact legal (the recovery must remain learnable), but measure its force
+    # so impact rather than mere touch can be penalised.
+    head_ground_cfg = ContactSensorCfg(
+        name="head_ground_contact",
+        primary=ContactMatch(mode="body", pattern="jaw_soft", entity="robot"),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("force",),
+        reduce="netforce",
+        num_slots=1,
+    )
 
     foot_frictions_geom_names = ("left_foot_collision", "right_foot_collision")
 
@@ -234,7 +243,7 @@ def make_microduck_sitstand_env_cfg(
     # Standup robot variant: full collision meshes — the body must physically
     # rest on the ground while seated, and knees/head may touch mid-transition.
     cfg.scene.entities = {"robot": MICRODUCK_STANDUP_ROBOT_CFG}
-    cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg)
+    cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg, head_ground_cfg)
     cfg.viewer.body_name = "trunk_base"
 
     cfg.episode_length_s = EPISODE_LENGTH_S
@@ -282,8 +291,8 @@ def make_microduck_sitstand_env_cfg(
     # during a transition only pays a small tracking cost.
     cfg.rewards["head_pose_tracking"] = RewardTermCfg(
         func=microduck_mdp.head_pose_tracking,
-        weight=0.75,
-        params={"command_name": "head_pose", "std": 0.5},
+        weight=1.5,
+        params={"command_name": "head_pose", "std": 0.4},
     )
 
     # L1 bootstrap — constant gradient toward the commanded pose.
@@ -348,11 +357,11 @@ def make_microduck_sitstand_env_cfg(
     )
 
     # ── Gentleness (the point of this env) — three complementary signals ─────
-    #  - ``descent_speed``: per-step penalty on downward vz beyond 0.05 m/s.
+    #  - ``descent_speed``: per-step penalty on downward vz beyond 0.035 m/s.
     #    THE anti-brutality term for the sit: a fast drop pays on every step
-    #    of the fall so it can't be amortised. -10 from step 0 (sit lesson:
-    #    at -5 a crash-sit was net-positive), tightened to -20 by curriculum.
-    #  - ``rise_speed``: the mirror cap for the stand-up (0.08 m/s). Starts at
+    #    of the fall so it can't be amortised. -15 from step 0 (sit lesson:
+    #    at -5 a crash-sit was net-positive), tightened to -30 by curriculum.
+    #  - ``rise_speed``: the mirror cap for the stand-up (0.07 m/s). Starts at
     #    weight 0 and is introduced at iter 750 by curriculum — the standup
     #    lesson: a motion-tax active while the skill is being DISCOVERED makes
     #    exploratory attempts net-negative and the skill is never found. The
@@ -385,8 +394,13 @@ def make_microduck_sitstand_env_cfg(
     )
     cfg.rewards["gentle_motion"] = RewardTermCfg(
         func=microduck_mdp.trunk_vertical_accel_penalty,
-        weight=0.05,
+        weight=0.10,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
+    )
+    cfg.rewards["head_impact"] = RewardTermCfg(
+        func=microduck_mdp.body_impact_cost,
+        weight=-0.25,
+        params={"sensor_name": head_ground_cfg.name, "threshold": 1.0},
     )
 
     # Two-layer upright pressure (sit env values — the anti-flop calibration):
@@ -449,7 +463,7 @@ def make_microduck_sitstand_env_cfg(
             "height_std":    0.03,
             "upright_std":   0.40,   # ≈ 23° effective — plank (~70°+) scores ~0
             "pose_std":      0.40,
-            "head_std":      0.40,   # head fully dropped (~1.2 rad) → factor ~0.01
+            "head_std":      0.30,   # head fully dropped (~1.2 rad) → factor ~0
         },
     )
 
@@ -464,6 +478,9 @@ def make_microduck_sitstand_env_cfg(
     # WITHOUT blocking a slow big motion, so heavier-than-velocity would also
     # be defensible — start at parity, tighten only if the real robot shakes.
     cfg.rewards["action_rate_l2"] = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.1)
+    cfg.rewards["neck_action_rate_l2"] = RewardTermCfg(
+        func=microduck_mdp.neck_action_rate_l2, weight=0.0
+    )
     cfg.rewards["joint_torque_rate_l2"] = RewardTermCfg(
         func=microduck_mdp.joint_torque_rate_l2, weight=0.0
     )
@@ -534,7 +551,7 @@ def make_microduck_sitstand_env_cfg(
     cfg.observations["actor"].terms["base_ang_vel"].noise    = Unoise(n_min=-0.03, n_max=0.03)
     cfg.observations["actor"].terms[gravity_term_name].noise = Unoise(n_min=-0.01, n_max=0.01)
     cfg.observations["actor"].terms["joint_pos"].noise       = Unoise(n_min=-0.001, n_max=0.001)
-    cfg.observations["actor"].terms["joint_vel"].noise       = Unoise(n_min=-0.25, n_max=0.25)
+    cfg.observations["actor"].terms["joint_vel"].noise       = Unoise(n_min=-0.08, n_max=0.08)
 
     # IMU mounting-misalignment DR (match velocity): per-env constant rotation of
     # the IMU-derived actor obs; critic keeps the true values.
@@ -640,7 +657,7 @@ def make_microduck_sitstand_env_cfg(
         mode="reset",
     )
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = foot_frictions_geom_names
-    cfg.events["foot_friction"].params["ranges"] = (0.7, 1.3)  # match velocity
+    cfg.events["foot_friction"].params["ranges"] = (0.6, 1.8)  # floor-to-carpet envelope
 
     # Base reset: standing, just above the measured equilibrium (STAND_Z=0.115).
     cfg.events["reset_base"].params["pose_range"]["z"] = (0.11, 0.12)
@@ -888,8 +905,23 @@ def make_microduck_sitstand_env_cfg(
         },
     )
 
-    # Descent-speed cap tightening: discover the sit under magnitude 10
-    # (crash-sit already net-negative), then tighten to 20. POSITIVE weights —
+    # Head-specific slew cost.  Delay it until both directions have been
+    # discovered, then suppress the fast nod that caused the real impact.
+    cfg.curriculum["neck_action_rate_weight"] = CurriculumTermCfg(
+        func=microduck_mdp.reward_weight,
+        params={
+            "reward_name": "neck_action_rate_l2",
+            "weight_stages": [
+                {"step": 0,          "weight": 0.0},
+                {"step": 750 * 24,   "weight": -0.10},
+                {"step": 1500 * 24,  "weight": -0.25},
+                {"step": 2500 * 24,  "weight": -0.35},
+            ],
+        },
+    )
+
+    # Descent-speed cap tightening: discover the sit under magnitude 15
+    # (crash-sit already net-negative), then tighten to 30. POSITIVE weights —
     # the function is self-negating (see the sign-convention warning at the
     # reward definitions).
     cfg.curriculum["descent_speed_weight"] = CurriculumTermCfg(
@@ -897,8 +929,8 @@ def make_microduck_sitstand_env_cfg(
         params={
             "reward_name":   "descent_speed",
             "weight_stages": [
-                {"step": 0,          "weight": 10.0},
-                {"step": 500 * 24,   "weight": 20.0},
+                {"step": 0,          "weight": 15.0},
+                {"step": 750 * 24,   "weight": 30.0},
             ],
         },
     )
@@ -1006,8 +1038,8 @@ MicroduckSitStandRlCfg = RslRlOnPolicyRunnerCfg(
         symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY else None,
     ),
     wandb_project="mjlab_microduck",
-    experiment_name="microduck_sitstand",
-    run_name="microduck_sitstand",
+    experiment_name="microduck_sitstand_gentle_v2",
+    run_name="microduck_sitstand_gentle_v2",
     save_interval=250,
     num_steps_per_env=24,
     max_iterations=15_000,

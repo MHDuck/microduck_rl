@@ -20,7 +20,7 @@ Meant to run as the LAST post_import_command of an onshape-to-robot config
 (see config_mjcf_groundcontact_backlash.json), but works standalone on any
 already-exported robot xml:
 
-    python3 add_backlash.py robot_groundcontact_backlash.xml --backlash-deg 2.0
+    python3 add_backlash.py robot_groundcontact_backlash.xml --backlash-deg 2.5
 
 ``--backlash-deg`` is the TOTAL peak-to-peak play (what you measure wiggling
 the horn with the servo held); the joint range is symmetric ±deg/2.
@@ -60,9 +60,9 @@ def build_backlash_default(half_range_rad: float, damping: float,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("xml", help="MJCF file to modify in place")
-    parser.add_argument("--backlash-deg", type=float, default=2.0,
+    parser.add_argument("--backlash-deg", type=float, default=2.5,
                         help="TOTAL backlash play in degrees (peak-to-peak); "
-                             "joint range is symmetric +/-deg/2 (default: 2.0)")
+                             "joint range is symmetric +/-deg/2 (default: 2.5)")
     parser.add_argument("--damping", type=float, default=0.01,
                         help="backlash joint damping (default: 0.01)")
     parser.add_argument("--armature", type=float, default=0.001,

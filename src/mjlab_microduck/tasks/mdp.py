@@ -3698,7 +3698,9 @@ def velocity_command_ranges_curriculum(
         env: The RL environment
         env_ids: Environment IDs (unused, but required by curriculum interface)
         command_name: Name of the velocity command term (e.g., "twist")
-        velocity_stages: List of dicts with 'step', 'lin_vel_range', and 'ang_vel_range' keys
+        velocity_stages: List of dicts with ``step`` and ``ang_vel_range``.
+            Use ``lin_vel_range`` for one shared x/y range, or independent
+            ``lin_vel_x_range`` and ``lin_vel_y_range`` keys.
             Example: [
                 {"step": 0, "lin_vel_range": 0.3, "ang_vel_range": 1.5},
                 {"step": 500 * 24, "lin_vel_range": 0.4, "ang_vel_range": 1.75},
@@ -3719,25 +3721,40 @@ def velocity_command_ranges_curriculum(
     cfg = cast(UniformVelocityCommandCfg, command_term.cfg)
 
     # Update velocity ranges based on current step
-    current_lin_vel = velocity_stages[0]["lin_vel_range"]
+    first_lin = velocity_stages[0].get(
+        "lin_vel_range", velocity_stages[0].get("lin_vel_x_range")
+    )
+    current_lin_vel_x = velocity_stages[0].get("lin_vel_x_range", first_lin)
+    current_lin_vel_y = velocity_stages[0].get("lin_vel_y_range", first_lin)
     current_ang_vel = velocity_stages[0]["ang_vel_range"]
 
     for stage in velocity_stages:
         if env.common_step_counter > stage["step"]:
-            current_lin_vel = stage["lin_vel_range"]
+            shared_lin = stage.get("lin_vel_range")
+            current_lin_vel_x = stage.get(
+                "lin_vel_x_range",
+                shared_lin if shared_lin is not None else current_lin_vel_x,
+            )
+            current_lin_vel_y = stage.get(
+                "lin_vel_y_range",
+                shared_lin if shared_lin is not None else current_lin_vel_y,
+            )
             current_ang_vel = stage["ang_vel_range"]
+
+    assert current_lin_vel_x is not None
+    assert current_lin_vel_y is not None
 
     # Update command ranges
     if forward_only:
-        cfg.ranges.lin_vel_x = (0.0, current_lin_vel)
+        cfg.ranges.lin_vel_x = (0.0, current_lin_vel_x)
     else:
-        cfg.ranges.lin_vel_x = (-current_lin_vel, current_lin_vel)
+        cfg.ranges.lin_vel_x = (-current_lin_vel_x, current_lin_vel_x)
     if update_lin_vel_y:
-        cfg.ranges.lin_vel_y = (-current_lin_vel, current_lin_vel)
+        cfg.ranges.lin_vel_y = (-current_lin_vel_y, current_lin_vel_y)
     if update_ang_vel_z:
         cfg.ranges.ang_vel_z = (-current_ang_vel, current_ang_vel)
 
-    return torch.tensor([current_lin_vel])
+    return torch.tensor([current_lin_vel_x])
 
 
 def projected_gravity(
@@ -3978,6 +3995,288 @@ def air_time_adaptive(
     # Zero reward when standing
     active = (total_speed >= command_threshold).float()
     return reward * active
+
+
+def touchdown_stride_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    min_command_speed: float = 0.05,
+    min_air_time: float = 0.16,
+    base_target_m: float = 0.035,
+    speed_target_s: float = 0.15,
+    max_target_m: float = 0.080,
+    progress_speed_m_s: float = 0.08,
+    lateral_command_std: float = 0.10,
+    yaw_command_std: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("left_foot", "right_foot")
+    ),
+) -> torch.Tensor:
+    """Reward useful fore-aft step length when exactly one foot touches down.
+
+    Velocity tracking has no preference between a normal stride and the short,
+    high-cadence shuffle observed on the real robot. This term is deliberately
+    event-based: on a genuine touchdown after ``min_air_time``, it measures the
+    two feet's separation projected onto the trunk's forward axis. The score
+    grows linearly to a speed-dependent target and then saturates, so there is
+    no incentive for an unsafe over-stride.
+
+    The reward is zero for standing, lateral/turning commands, double touchdown,
+    reset frames and motion opposite to the commanded direction. This prevents
+    a split stance or in-place foot tapping from becoming a per-step jackpot.
+    """
+    from mjlab.sensor import ContactSensor
+
+    sensor: ContactSensor = env.scene[sensor_name]
+    contact_time = sensor.data.current_contact_time
+    last_air_time = sensor.data.last_air_time
+    assert contact_time is not None
+    assert last_air_time is not None
+
+    # A newly established contact has accumulated no more than one control step
+    # (allow 50% numerical slack for substep/contact bookkeeping).
+    new_contact = (contact_time > 0.0) & (contact_time <= 1.5 * env.step_dt)
+    genuine_touchdown = new_contact & (last_air_time >= min_air_time)
+    exactly_one_touchdown = genuine_touchdown.sum(dim=1) == 1
+
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_pos_w = asset.data.site_pos_w[:, asset_cfg.site_ids, :]
+    foot_delta_w = foot_pos_w[:, 0, :] - foot_pos_w[:, 1, :]
+    forward_axis_w = matrix_from_quat(asset.data.root_link_quat_w)[:, :, 0]
+    stride_m = torch.abs(torch.sum(foot_delta_w * forward_axis_w, dim=1))
+
+    command = env.command_manager.get_command(command_name)
+    cmd_x = command[:, 0]
+    abs_cmd_x = torch.abs(cmd_x)
+    target_m = torch.clamp(
+        base_target_m + speed_target_s * abs_cmd_x,
+        max=max_target_m,
+    )
+    stride_score = torch.clamp(stride_m / target_m.clamp_min(1e-6), max=1.0)
+
+    # Only reward displacement in the requested direction. A soft progress gate
+    # reaches one at 0.10 m/s and removes the tap-in-place exploit without
+    # requiring perfect velocity tracking.
+    direction = torch.sign(cmd_x)
+    progress = direction * asset.data.root_link_lin_vel_b[:, 0]
+    progress_gate = torch.clamp(progress / max(progress_speed_m_s, 1e-6), 0.0, 1.0)
+
+    straight_gate = torch.exp(
+        -torch.square(command[:, 1] / lateral_command_std)
+        -torch.square(command[:, 2] / yaw_command_std)
+    )
+    active = (abs_cmd_x >= min_command_speed) & (env.episode_length_buf > 1)
+    return (
+        stride_score
+        * progress_gate
+        * straight_gate
+        * exactly_one_touchdown.float()
+        * active.float()
+    )
+
+
+def swing_foot_lead_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    min_command_speed: float = 0.05,
+    min_air_time: float = 0.10,
+    max_air_time: float = 0.45,
+    base_target_m: float = 0.035,
+    speed_target_s: float = 0.15,
+    max_target_m: float = 0.080,
+    progress_speed_m_s: float = 0.08,
+    lateral_command_std: float = 0.10,
+    yaw_command_std: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("left_foot", "right_foot")
+    ),
+) -> torch.Tensor:
+    """Densely reward the swing foot moving past the support foot.
+
+    For forward walking, a left swing is useful only after the left foot moves
+    ahead of the right support foot (and vice versa). Multiplying the signed
+    left-right separation by the swing-foot side and command direction gives a
+    positive lead only in that useful latter half of the stride. This avoids
+    rewarding a foot merely for staying lifted behind the body.
+
+    The reward is active only during genuine single support, inside a bounded
+    air-time window, on mostly straight commands and while the base progresses
+    in the requested direction. It therefore complements the sparse touchdown
+    reward without paying standing, hopping in place, turning or overlong holds.
+    """
+    from mjlab.sensor import ContactSensor
+
+    sensor: ContactSensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time
+    assert air_time is not None
+
+    left_air = air_time[:, 0] > 0.0
+    right_air = air_time[:, 1] > 0.0
+    single_swing = left_air ^ right_air
+    swing_time = torch.maximum(air_time[:, 0], air_time[:, 1])
+    valid_swing_time = (swing_time >= min_air_time) & (swing_time <= max_air_time)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_pos_w = asset.data.site_pos_w[:, asset_cfg.site_ids, :]
+    foot_delta_w = foot_pos_w[:, 0, :] - foot_pos_w[:, 1, :]
+    forward_axis_w = matrix_from_quat(asset.data.root_link_quat_w)[:, :, 0]
+    left_minus_right_m = torch.sum(foot_delta_w * forward_axis_w, dim=1)
+
+    command = env.command_manager.get_command(command_name)
+    cmd_x = command[:, 0]
+    abs_cmd_x = torch.abs(cmd_x)
+    swing_side = left_air.float() - right_air.float()
+    signed_lead_m = left_minus_right_m * swing_side * torch.sign(cmd_x)
+
+    target_m = torch.clamp(
+        base_target_m + speed_target_s * abs_cmd_x,
+        max=max_target_m,
+    )
+    lead_score = torch.clamp(signed_lead_m / target_m.clamp_min(1e-6), 0.0, 1.0)
+
+    progress = torch.sign(cmd_x) * asset.data.root_link_lin_vel_b[:, 0]
+    progress_gate = torch.clamp(progress / max(progress_speed_m_s, 1e-6), 0.0, 1.0)
+    straight_gate = torch.exp(
+        -torch.square(command[:, 1] / lateral_command_std)
+        -torch.square(command[:, 2] / yaw_command_std)
+    )
+    active = (abs_cmd_x >= min_command_speed) & (env.episode_length_buf > 1)
+    return (
+        lead_score
+        * progress_gate
+        * straight_gate
+        * single_swing.float()
+        * valid_swing_time.float()
+        * active.float()
+    )
+
+
+def swing_foot_progress_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    min_command_speed: float = 0.05,
+    target_base_m: float = 0.045,
+    target_speed_s: float = 0.15,
+    target_max_m: float = 0.100,
+    progress_speed_m_s: float = 0.08,
+    lateral_command_std: float = 0.10,
+    yaw_command_std: float = 0.30,
+    max_normalized_delta: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("left_foot", "right_foot")
+    ),
+) -> torch.Tensor:
+    """Potential shaping for forward progress of the airborne foot.
+
+    Returns the signed per-step change in swing-foot lead, normalized by the
+    desired stride length. Advancing from behind the support foot pays from the
+    first millimetre; retreating charges the same amount, and holding still pays
+    zero. State is reset at each new swing, command-direction change and episode
+    reset, so no transition can create an artificial jackpot.
+    """
+    from mjlab.sensor import ContactSensor
+
+    sensor: ContactSensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time
+    assert air_time is not None
+    left_air = air_time[:, 0] > 0.0
+    right_air = air_time[:, 1] > 0.0
+    single_swing = left_air ^ right_air
+    swing_side = left_air.to(torch.int8) - right_air.to(torch.int8)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_pos_w = asset.data.site_pos_w[:, asset_cfg.site_ids, :]
+    foot_delta_w = foot_pos_w[:, 0, :] - foot_pos_w[:, 1, :]
+    forward_axis_w = matrix_from_quat(asset.data.root_link_quat_w)[:, :, 0]
+    left_minus_right_m = torch.sum(foot_delta_w * forward_axis_w, dim=1)
+
+    command = env.command_manager.get_command(command_name)
+    cmd_x = command[:, 0]
+    cmd_dir = torch.sign(cmd_x).to(torch.int8)
+    signed_lead_m = left_minus_right_m * swing_side.float() * cmd_dir.float()
+
+    state_shape_changed = (
+        not hasattr(env, "_swing_progress_prev_lead")
+        or env._swing_progress_prev_lead.shape[0] != env.num_envs
+    )
+    if state_shape_changed:
+        env._swing_progress_prev_lead = signed_lead_m.clone()
+        env._swing_progress_prev_side = swing_side.clone()
+        env._swing_progress_prev_cmd_dir = cmd_dir.clone()
+        env._swing_progress_prev_active = single_swing.clone()
+
+    reset = env.episode_length_buf <= 1
+    new_swing = (
+        ~env._swing_progress_prev_active
+        | (swing_side != env._swing_progress_prev_side)
+        | (cmd_dir != env._swing_progress_prev_cmd_dir)
+        | reset
+    )
+    delta_m = torch.where(
+        single_swing & ~new_swing,
+        signed_lead_m - env._swing_progress_prev_lead,
+        torch.zeros_like(signed_lead_m),
+    )
+
+    env._swing_progress_prev_lead = signed_lead_m.clone()
+    env._swing_progress_prev_side = swing_side.clone()
+    env._swing_progress_prev_cmd_dir = cmd_dir.clone()
+    env._swing_progress_prev_active = single_swing.clone()
+
+    target_m = torch.clamp(
+        target_base_m + target_speed_s * torch.abs(cmd_x),
+        max=target_max_m,
+    )
+    progress_score = torch.clamp(
+        delta_m / target_m.clamp_min(1e-6),
+        -max_normalized_delta,
+        max_normalized_delta,
+    )
+    base_progress = cmd_dir.float() * asset.data.root_link_lin_vel_b[:, 0]
+    base_progress_gate = torch.clamp(
+        base_progress / max(progress_speed_m_s, 1e-6), 0.0, 1.0
+    )
+    straight_gate = torch.exp(
+        -torch.square(command[:, 1] / lateral_command_std)
+        -torch.square(command[:, 2] / yaw_command_std)
+    )
+    active = (torch.abs(cmd_x) >= min_command_speed) & single_swing & ~reset
+    return progress_score * base_progress_gate * straight_gate * active.float()
+
+
+def short_swing_cost(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    minimum_swing_s: float = 0.20,
+    min_command_speed: float = 0.05,
+) -> torch.Tensor:
+    """Cost for touching down before the minimum useful swing duration.
+
+    Returns a non-negative touchdown-event cost; configure it with a NEGATIVE
+    reward weight. A 0 s tap costs 1, a swing at ``minimum_swing_s`` or longer
+    costs 0. Reset landings and standing commands are excluded.
+    """
+    from mjlab.sensor import ContactSensor
+
+    sensor: ContactSensor = env.scene[sensor_name]
+    contact_time = sensor.data.current_contact_time
+    last_air_time = sensor.data.last_air_time
+    assert contact_time is not None
+    assert last_air_time is not None
+    new_contact = (contact_time > 0.0) & (contact_time <= 1.5 * env.step_dt)
+    shortfall = torch.clamp(
+        (minimum_swing_s - last_air_time) / max(minimum_swing_s, 1e-6),
+        0.0,
+        1.0,
+    )
+    command = env.command_manager.get_command(command_name)
+    moving = torch.linalg.vector_norm(command[:, :2], dim=1) >= min_command_speed
+    valid = moving & (env.episode_length_buf > 1)
+    return torch.sum(new_contact.float() * shortfall, dim=1) * valid.float()
 
 
 def stillness_at_zero_command(
@@ -4515,7 +4814,7 @@ def set_random_crouch_state(
     lam = torch.rand(num, device=env.device) * (depth_max - depth_min) + depth_min
 
     # Joints: lerp HOME → anchor on the leg pitch chain, uniform noise on the
-    # servo joints only (passive_* backlash hinges have ±1° ranges — noise
+    # servo joints only (passive_* backlash hinges have ±1.25° ranges — noise
     # there would spawn them pinned outside their limits).
     joints = asset.data.default_joint_pos[env_ids].clone()
     for name, anchor in _CROUCH_ANCHOR_BY_NAME.items():
@@ -4745,6 +5044,28 @@ class VelocityCommandCommandOnly(UniformVelocityCommand):
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
         super()._resample_command(env_ids)
+        # Low-speed forward practice. Uniform sampling spends little time at the
+        # 0.1--0.2 m/s commands used on the real robot and mixes those samples
+        # with lateral/yaw commands. A dedicated bucket makes "move slowly and
+        # straight" a well-trained behaviour instead of a friction-dependent
+        # boundary between standing and an aggressive gait.
+        p_slow = getattr(self.cfg, "rel_slow_forward_envs", 0.0)
+        occupied = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+        if p_slow > 0.0:
+            eligible = ~self.is_standing_env[env_ids]
+            draw = torch.empty(len(env_ids), device=self.device).uniform_(0.0, 1.0)
+            slow_mask = eligible & (draw < p_slow)
+            slow_ids = env_ids[slow_mask]
+            occupied |= slow_mask
+            if len(slow_ids) > 0:
+                slow_lo, slow_hi = self.cfg.slow_forward_range
+                self.vel_command_b[slow_ids, 0] = torch.empty(
+                    len(slow_ids), device=self.device
+                ).uniform_(slow_lo, slow_hi)
+                self.vel_command_b[slow_ids, 1] = 0.0
+                self.vel_command_b[slow_ids, 2] = 0.0
+                self.vel_command_w[slow_ids] = self.vel_command_b[slow_ids]
+
         # Turn-in-place practice: for a fraction of envs, zero the linear velocity
         # and force a meaningful (away-from-zero) yaw command. Independent uniform
         # sampling almost never produces "lin≈0, |ang| large" (~2% of samples), so
@@ -4754,7 +5075,12 @@ class VelocityCommandCommandOnly(UniformVelocityCommand):
         if p <= 0.0:
             return
         r = torch.empty(len(env_ids), device=self.device)
-        turn_ids = env_ids[r.uniform_(0.0, 1.0) < p]
+        turn_mask = (
+            (~self.is_standing_env[env_ids])
+            & (~occupied)
+            & (r.uniform_(0.0, 1.0) < p)
+        )
+        turn_ids = env_ids[turn_mask]
         if len(turn_ids) == 0:
             return
         self.vel_command_b[turn_ids, 0] = 0.0
@@ -4804,6 +5130,11 @@ class VelocityCommandCommandOnly(UniformVelocityCommand):
 
 @_dataclass(kw_only=True)
 class VelocityCommandCommandOnlyCfg(UniformVelocityCommandCfg):
+    # Fraction of non-standing resamples dedicated to straight, positive,
+    # low-speed walking. Disabled by default so other tasks keep their current
+    # command distribution.
+    rel_slow_forward_envs: float = 0.0
+    slow_forward_range: tuple[float, float] = (0.06, 0.20)
     # Fraction of envs commanded to turn in place (lin=0, |ang| forced to
     # [0.4·max, max]) each resample. 0 = disabled (base uniform sampling only).
     rel_turn_in_place_envs: float = 0.0
@@ -5114,9 +5445,30 @@ def gait_symmetry_penalty(
     return torch.abs(L - R) / (L + R + 1e-3)
 
 
+def _spawn_heading_error(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Wrapped yaw error from each environment's heading at reset."""
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w  # (N, 4) [w, x, y, z]
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+    if not hasattr(env, "_heading_ref") or env._heading_ref.shape[0] != env.num_envs:
+        env._heading_ref = yaw.clone()
+    just_reset = env.episode_length_buf <= 1
+    env._heading_ref = torch.where(just_reset, yaw, env._heading_ref)
+
+    err = yaw - env._heading_ref
+    return torch.atan2(torch.sin(err), torch.cos(err))
+
+
 def heading_hold_reward(
     env: ManagerBasedRlEnv,
     std: float = 0.4,
+    command_name: str | None = None,
+    command_std: float = 0.1,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Reward holding the SPAWN heading (go straight) — corrective, angle-based.
@@ -5134,19 +5486,42 @@ def heading_hold_reward(
     invariant: the reference is each env's own random spawn yaw, so it works with
     the full-circle yaw randomisation at reset.
     """
-    asset: Entity = env.scene[asset_cfg.name]
-    quat = asset.data.root_link_quat_w  # (N, 4) [w, x, y, z]
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    err = _spawn_heading_error(env, asset_cfg)
+    reward = torch.exp(-(err ** 2) / std ** 2)
+    if command_name is not None:
+        # Only ask for spawn-heading hold when the requested yaw rate is near
+        # zero. Otherwise this objective would fight intentional turns.
+        yaw_cmd = env.command_manager.get_command(command_name)[:, 2]
+        reward = reward * torch.exp(-(yaw_cmd ** 2) / command_std ** 2)
+    return reward
 
-    if not hasattr(env, "_heading_ref") or env._heading_ref.shape[0] != env.num_envs:
-        env._heading_ref = yaw.clone()
-    just_reset = env.episode_length_buf <= 1
-    env._heading_ref = torch.where(just_reset, yaw, env._heading_ref)
 
-    err = yaw - env._heading_ref
-    err = torch.atan2(torch.sin(err), torch.cos(err))  # wrap to [-π, π]
-    return torch.exp(-(err ** 2) / std ** 2)
+def heading_error_l1_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    min_forward_speed: float = 0.05,
+    lateral_command_std: float = 0.05,
+    yaw_command_std: float = 0.06,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize accumulated yaw error while the command asks to go straight.
+
+    ``heading_hold_reward`` gives precise local shaping, but its Gaussian
+    gradient becomes negligible after a sizeable veer.  The L1 term keeps a
+    constant corrective gradient at large errors.  It is gated to meaningful
+    fore/aft motion with near-zero lateral and yaw commands, so intentional
+    side-steps and turns remain unconstrained.
+
+    Returns a non-positive value; configure it with a positive reward weight.
+    """
+    err = _spawn_heading_error(env, asset_cfg)
+    command = env.command_manager.get_command(command_name)
+    straight_gate = torch.exp(
+        -torch.square(command[:, 1] / max(lateral_command_std, 1e-6))
+        -torch.square(command[:, 2] / max(yaw_command_std, 1e-6))
+    )
+    moving = (torch.abs(command[:, 0]) >= min_forward_speed).float()
+    return -torch.abs(err) * straight_gate * moving
 
 
 def action_over_limit_penalty(
@@ -5615,6 +5990,7 @@ def head_pose_bias_penalty(
     env: ManagerBasedRlEnv,
     command_name: str = "head_pose",
     tau_s: float = 1.0,
+    component_indices: tuple[int, ...] | None = None,
     gate_height_low: float | None = None,
     gate_height_high: float = 0.11,
     gate_tilt_full_deg: float = 20.0,
@@ -5632,6 +6008,10 @@ def head_pose_bias_penalty(
     stepping altogether (wandb 5yay13u4). The steady-state droop IS escapable:
     the policy can bias its neck command up to cancel gravity sag. Averaging
     over ``tau_s`` lets the oscillation cancel and prices only the bias.
+
+    ``component_indices`` optionally focuses the cost on selected command
+    components.  Velocity uses (0, 1), the two pitch joints, so an unwanted
+    walking head lift is not diluted by well-tracked yaw and roll.
 
     L1 (not Gaussian) on purpose: the gradient stays constant at large bias,
     where a tight Gaussian would be flat and dead.
@@ -5696,7 +6076,10 @@ def head_pose_bias_penalty(
 
     alpha = min(1.0, float(env.step_dt) / max(tau_s, 1e-6))
     env._head_bias_ema = (1.0 - alpha) * env._head_bias_ema + alpha * err
-    out = -env._head_bias_ema.abs().mean(dim=-1)
+    bias = env._head_bias_ema
+    if component_indices is not None:
+        bias = bias[:, list(component_indices)]
+    out = -bias.abs().mean(dim=-1)
     if gate is not None:
         out = out * gate
     return out

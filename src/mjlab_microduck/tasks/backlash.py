@@ -5,7 +5,7 @@ counterpart (task ids ``Mjlab-<Task>-<Flat|Rough>-Backlash-MicroDuck``):
 
 1. Robot → the matching backlash robot cfg (an unactuated
    ``passive_<joint>_backlash`` hinge in series with each of the 14 servo
-   joints, ±1° play) driven by BacklashEncoderBamActuator, whose firmware PD
+   joints, ±1.25° play) driven by BacklashEncoderBamActuator, whose firmware PD
    closes on the encoder READING THROUGH the backlash — like the real servo,
    whose encoder sits on the output side of the gear play. Pass the robot cfg
    that mirrors the base task's model: MICRODUCK_WALK_BACKLASH_ROBOT_CFG for
@@ -17,7 +17,7 @@ counterpart (task ids ``Mjlab-<Task>-<Flat|Rough>-Backlash-MicroDuck``):
    encoder-bias DR path (``biased`` param) intact. Obs and action dims are
    unchanged (still 14 joints), so runtime/export need no changes.
 3. dof_pos_limits reward is scoped to the servo joints: backlash joints spend
-   their life pinned against their ±1° limits (that is the point of backlash),
+   their life pinned against their ±1.25° limits (that is the point of backlash),
    which would otherwise feed a permanent out-of-soft-limit penalty.
 
 Everything else (rewards, DR events, curricula) carries over untouched — the

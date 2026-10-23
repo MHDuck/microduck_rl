@@ -13,7 +13,10 @@ from mjlab_microduck.robot.microduck_constants import (
     SERVO_GEOM_SUFFIX,
     get_allcollisions_backlash_spec,
     get_allcollisions_spec,
+    get_backlash_spec,
+    get_rollers_backlash_spec,
     get_standup_spec,
+    get_walk_backlash_spec,
 )
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks import microduck_velstand_env_cfg as vs
@@ -53,10 +56,23 @@ def test_allcollisions_matches_groundcontact_kinematics():
     assert a.ngeom > g.ngeom  # it really is the fuller collision set
 
 
-def test_backlash_twin_has_14_backlash_joints():
-    m = get_allcollisions_backlash_spec().compile()
-    names = [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(m.njnt)]
-    assert sum(n.startswith("passive_") and n.endswith("_backlash") for n in names) == 14
+@pytest.mark.parametrize("spec_fn", [
+    get_walk_backlash_spec, get_backlash_spec,
+    get_allcollisions_backlash_spec, get_rollers_backlash_spec,
+])
+def test_backlash_models_have_14_joints_with_2_5_degree_total_play(spec_fn):
+    model = spec_fn().compile()
+    backlash = [
+        model.joint(j) for j in range(model.njnt)
+        if model.joint(j).name.startswith("passive_")
+        and model.joint(j).name.endswith("_backlash")
+    ]
+    assert len(backlash) == 14 and model.nu == 14
+    half_range = math.radians(1.25)
+    for joint in backlash:
+        assert joint.limited
+        assert tuple(joint.range) == pytest.approx((-half_range, half_range))
+        assert joint.id not in model.actuator_trnid[:, 0]
 
 
 # ── Cfg ──────────────────────────────────────────────────────────────────────

@@ -33,8 +33,8 @@ def test_cpu_bam_constants_mirror_training_cfg(ip):
     from bam.mjlab import BamActuator
     from mjlab_microduck.robot.microduck_constants import _BAM_ACTUATOR_KWARGS as k
 
-    assert ip.BAM_MOTOR_NAME == k["motor_name"]
-    assert ip.BAM_MODEL == k["model"]
+    assert ip.BAM_PARAMS_PATH == Path(k["json_path"])
+    assert k.get("motor_name") is None and k.get("model") is None
     assert ip.BAM_KP_FW == k["kp_fw"]
     assert ip.BAM_VIN_RANGE == k["vin_range"]
     assert ip.BAM_VIN_DROP_GAIN_RANGE == k["vin_drop_gain_range"]

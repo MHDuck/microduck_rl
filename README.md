@@ -90,15 +90,15 @@ uv run scripts/infer_policy.py --walking walk.onnx --standing stand.onnx \
 
 Keyboard-driven (velocity commands, `G` ground pick, `Y` sit/stand, `R` roulade,
 `K`/`L` kicks); `--debug`, `--save-csv`, `--record` support sim2real comparisons.
-The servos are simulated with the same BAM M6 XL330 model the policies are
+The servos are simulated with the same BAM M6 HD1910 model the policies are
 trained against (voltage control + load-dependent friction, via
 `bam.mujoco.MujocoController`); `--vin` / `--vin-drop-gain` / `--kp-fw` pin the
 training DR ranges to one value, `--no-bam` falls back to the XML PD actuators.
 
 ### Backlash variants
 
-Every main task has a **Backlash** twin that trains on a model with ±1° of gear
-play (2° total) in series with each of the 14 servo joints: insert `-Backlash`
+Every main task has a **Backlash** twin that trains on a model with ±1.25° of gear
+play (2.5° total) in series with each of the 14 servo joints: insert `-Backlash`
 before `MicroDuck` in the task id, e.g. `Mjlab-Velocity-Flat-Backlash-MicroDuck`.
 
 The backlash is modeled properly for sim2real: each servo gets an unactuated
@@ -111,8 +111,8 @@ See `src/mjlab_microduck/tasks/backlash.py`.
 
 ## Actuator model
 
-All tasks use the [BAM](https://github.com/Rhoban/bam) M6 actuator model for
-the Dynamixel XL330 (voltage control law, back-EMF, Coulomb/Stribeck/load-dependent
+All Microduck tasks use the [BAM](https://github.com/Rhoban/bam) M6 actuator model for
+the Feetech HD1910 (also called HLS1910) (voltage control law, back-EMF, Coulomb/Stribeck/load-dependent
 friction), with per-env domain randomization on battery voltage, voltage sag
 under load, command delay, and friction magnitude
 (`FrictionDRBamActuator` in `src/mjlab_microduck/actuator/`).
@@ -120,6 +120,50 @@ under load, command delay, and friction magnitude
 At this scale — tiny servos driving a ~800 g biped — actuator fidelity is most
 of the sim2real gap, which is why the actuator is modeled down to its voltage
 control law instead of an ideal PD.
+
+### HD1910 settings in this checkout
+
+The fitted motor/friction parameters in
+[src/mjlab_microduck/robot/microduck/params/1910_m6.json](src/mjlab_microduck/robot/microduck/params/1910_m6.json)
+come unchanged from [LuwuDynamics/xgoduck_rl at 326d77a](https://github.com/LuwuDynamics/xgoduck_rl/blob/326d77a1122870bdefa2c36403937502c958e69c/src/mjlab_microduck/robot/xgoduck/params/1910_m6.json).
+The JSON's `sts3215` key selects BAM's Feetech firmware law; its fitted motor
+parameters are for the 1910, rather than the stock STS3215 defaults.
+
+| Setting | Value |
+|---|---|
+| Firmware P | 30 (match this on the real servos) |
+| Battery voltage DR | 7.4–8.0 V |
+| Voltage sag gain / floor | 0–0.2 V/Nm / 7.0 V |
+| Command delay | 3–6 physics steps (15–30 ms at 5 ms/step) |
+| Torque constant / resistance | 0.623761 Nm/A / 4.910192 ohm |
+| Reflected inertia | 0.001781905 kg m² |
+| Internal goal rate ceiling | 100 rad/s, as in the reference fit |
+| Firmware current limiter | Off; BAM's Feetech controller does not implement it |
+
+These settings apply to ordinary, roller, and backlash Microduck tasks and to
+the CPU BAM rehearsal. Feetech's internal goal buffer is initialized and reset
+in both paths. The explicit XL330 pendulum testbench and its hardware tools
+remain XL330 fixtures.
+
+XgoDuck also replaces the robot meshes, link masses/inertias, HOME pose,
+standing/sitting heights, collision setup, and some task rewards. This checkout
+keeps Microduck's mechanical model, joint order, 61D observations, 50 Hz policy
+rate, and reward recipes. The existing XL330 housing meshes and link inertias
+are still the original CAD values; motor replacement alone does not measure
+the new robot's mass distribution. A real transfer needs those measured if the
+hardware differs.
+
+Start a new HD1910 training run; old XL330 policies are not validated for these
+actuators. Before a full run:
+
+```bash
+uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 64 --agent.max_iterations 5 --agent.logger tensorboard --agent.run-name hd1910_smoke
+```
+
+Use `scripts/export.py` to bake the normalizer into ONNX, and rehearse with
+`scripts/infer_policy.py --walking output.onnx --new-cmd-obs --kp-fw 30 --vin 7.4`.
+Published manifests identify the servos as `hd1910`; the hardware runtime still
+needs a matching Feetech driver and firmware gains.
 
 ## Robot models
 

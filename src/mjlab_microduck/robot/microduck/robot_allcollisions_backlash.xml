@@ -90,7 +90,7 @@
   <contact>
     <exclude body1="neck_pitch" body2="jaw_soft"/>
   </contact>
-  <!-- Backlash injected by add_backlash.py: 2 deg total play (symmetric +/-1 deg) -->
+  <!-- Backlash injected by add_backlash.py: 2.5 deg total play (symmetric +/-1.25 deg) -->
   <default>
     <default class="backlash">
       <!-- stiff limit constraint: with a range this small the default
@@ -98,7 +98,7 @@
            load. 0.01 = 2*sim_dt (mjlab velocity tasks run dt=0.005),
            the stiffest stable setting; solimp raises the impedance so
            the gear-teeth contact is nearly rigid. -->
-      <joint damping="0.01" frictionloss="0" armature="0.001" limited="true" range="-0.017453292519943295 0.017453292519943295" solreflimit="0.01 1" solimplimit="0.95 0.999 0.0001 0.5 2"/>
+      <joint damping="0.01" frictionloss="0" armature="0.001" limited="true" range="-0.021816615649929118 0.021816615649929118" solreflimit="0.01 1" solimplimit="0.95 0.999 0.0001 0.5 2"/>
     </default>
   </default>
   <worldbody>

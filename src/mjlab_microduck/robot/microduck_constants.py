@@ -12,6 +12,8 @@ from mjlab.utils.spec_config import CollisionCfg
 
 
 _ROBOT_DIR: Path = Path(os.path.dirname(__file__)) / "microduck"
+HD1910_PARAMS_PATH: Path = _ROBOT_DIR / "params" / "1910_m6.json"
+MICRODUCK_REAL_MASS_KG = 0.821
 
 MICRODUCK_WALK_XML: Path = _ROBOT_DIR / "robot_walk.xml"
 # Ground-contact model (formerly "allcollisions"): curated collision set for
@@ -28,7 +30,7 @@ MICRODUCK_BALL_XML: Path = _ROBOT_DIR / "ball.xml"
 # Roller-skate model: 14 actuated joints + passive wheel hinges (passive_*wheel).
 MICRODUCK_GROUNDCONTACT_ROLLERS_XML: Path = _ROBOT_DIR / "robot_groundcontact_rollers.xml"
 # Backlash models: every servo joint gets an unactuated passive_<joint>_backlash
-# hinge in series (±1° play, 2° total). Exported via
+# hinge in series (±1.25° play, 2.5° total). Exported via
 # config_mjcf_{groundcontact,walk}_backlash.json (add_backlash.py post-processor).
 MICRODUCK_GROUNDCONTACT_BACKLASH_XML: Path = _ROBOT_DIR / "robot_groundcontact_backlash.xml"
 MICRODUCK_WALK_BACKLASH_XML: Path = _ROBOT_DIR / "robot_walk_backlash.xml"
@@ -46,8 +48,28 @@ assert MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML.exists(), f"XML not found: {
 assert MICRODUCK_ALLCOLLISIONS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_BACKLASH_XML}"
 
 
+def _retarget_total_mass(spec: mujoco.MjSpec, target_mass: float) -> mujoco.MjSpec:
+    """Scale link masses and inertias to the measured assembled robot mass.
+
+    The official CAD export sums to about 737 g, while this HD1910 build weighs
+    821 g. Until per-link measurements are available, proportional scaling keeps
+    the official CoM and inertia distribution while fixing the large global
+    inertia mismatch.
+    """
+    bodies = [body for body in spec.bodies if body.mass > 0.0]
+    source_mass = sum(float(body.mass) for body in bodies)
+    if source_mass <= 0.0:
+        raise ValueError("robot spec has no positive body mass")
+    scale = target_mass / source_mass
+    for body in bodies:
+        body.mass = float(body.mass) * scale
+        body.fullinertia = [float(value) * scale for value in body.fullinertia]
+    return spec
+
+
 def get_walk_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_XML))
+    spec = mujoco.MjSpec.from_file(str(MICRODUCK_WALK_XML))
+    return _retarget_total_mass(spec, MICRODUCK_REAL_MASS_KG)
 
 
 def get_standup_spec() -> mujoco.MjSpec:
@@ -106,7 +128,8 @@ def get_backlash_spec() -> mujoco.MjSpec:
 
 
 def get_walk_backlash_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_BACKLASH_XML))
+    spec = mujoco.MjSpec.from_file(str(MICRODUCK_WALK_BACKLASH_XML))
+    return _retarget_total_mass(spec, MICRODUCK_REAL_MASS_KG)
 
 
 def get_rollers_backlash_spec() -> mujoco.MjSpec:
@@ -130,7 +153,9 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
         r".*right_knee.*": 0.0049,
         r".*left_ankle.*": 0.4530,
         r".*right_ankle.*": -0.4530,
-        # Head
+        # Head — verified stable hardware HOME.  Walking head lift is a policy
+        # bias and must be corrected by the locomotion reward, not by moving
+        # the zero-action reference used by every policy.
         r".*neck_pitch.*": 0.3491,
         r".*head_pitch.*": 0.3491,
         r".*head_yaw.*": 0.0,
@@ -159,17 +184,15 @@ FULL_COLLISION = CollisionCfg(
 #   - vin_range: per-env battery voltage sampled at startup (replaces fixed vin)
 #   - vin_drop_gain_range: load-dependent voltage sag V_drop = gain * sum(|tau|)
 #   - vin_min: hard floor on the effective voltage after sag
-# kp_fw kept at 200 (microduck's preserved firmware stiffness; microban uses 125).
+# HD1910 / HLS1910 identification from LuwuDynamics/xgoduck_rl (326d77a).
+# The JSON uses BAM's sts3215 firmware law with fitted 1910 motor/friction values.
 _BAM_ACTUATOR_KWARGS = dict(
-    motor_name="xl330",
-    model="m6",
+    json_path=str(HD1910_PARAMS_PATH),
     target_names_expr=(r"^(?!passive_).*",),
-    kp_fw=200.0,  # microduck's preserved firmware stiffness (microban uses 125)
-    # vin_range=(6.9, 7.9),
-    vin_range=(6.5, 8.2),
+    kp_fw=5.0,  # Match this P setting on the real Feetech servos.
+    vin_range=(7.0, 7.6),
     vin_drop_gain_range=(0.0, 0.2),
-    vin_min=6.0,
-    # max_current=1.75,
+    vin_min=6.8,
     delay_min_lag=3,
     delay_max_lag=6,
 )
@@ -190,7 +213,7 @@ backlash_actuators = BacklashEncoderBamActuatorCfg(**_BAM_ACTUATOR_KWARGS)
 
 # HOME frame for the backlash model. HOME_FRAME's unanchored patterns
 # (e.g. r".*left_hip_roll.*") would also match passive_left_hip_roll_backlash
-# and try to initialize it at -0.0873 rad — outside its ±1° range. Pattern
+# and try to initialize it at -0.0873 rad — outside its ±1.25° range. Pattern
 # matching is first-match-wins in declaration order, so the anchored backlash
 # rule placed FIRST pins every backlash joint at 0 and the servo joints fall
 # through to the normal HOME values.
@@ -242,7 +265,7 @@ MICRODUCK_GROUND_PICK_ROBOT_CFG = EntityCfg(
     ),
 )
 
-# Backlash robots: base model + ±1° serial backlash hinge per servo.
+# Backlash robots: base model + ±1.25° serial backlash hinge per servo.
 # Encoder reads through the backlash (BacklashEncoderBamActuator feedback +
 # joint_pos/vel_rel_backlash observations — see tasks/backlash.py).
 # Groundcontact variant → VelStand/StandUp backlash tasks (mirrors
